@@ -15,6 +15,7 @@ from conductor.providers.claude_agent_sdk import (
     CLAUDE_AGENT_SDK_AVAILABLE,
     ClaudeAgentSdkProvider,
 )
+from conductor.providers.claudebox import ClaudeboxProvider
 from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 from conductor.providers.hermes import HERMES_SDK_AVAILABLE, HermesProvider
@@ -24,7 +25,9 @@ if TYPE_CHECKING:
     from conductor.config.schema import ProviderSettings
 
 
-ProviderType = Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes"]
+ProviderType = Literal[
+    "copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "claudebox"
+]
 
 
 async def create_provider(
@@ -205,11 +208,23 @@ async def create_provider(
                 max_turns=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
             )
+        case "claudebox":
+            # Stub registration only (M0) — execute() raises
+            # NotImplementedError until the M1 subprocess integration lands.
+            provider = ClaudeboxProvider(
+                model=default_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                max_agent_iterations=max_agent_iterations,
+                max_session_seconds=max_session_seconds,
+            )
         case _:
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
                 suggestion=(
-                    "Valid providers are: copilot, openai-agents, claude, claude-agent-sdk, hermes"
+                    "Valid providers are: copilot, openai-agents, claude, "
+                    "claude-agent-sdk, hermes, claudebox"
                 ),
             )
 
