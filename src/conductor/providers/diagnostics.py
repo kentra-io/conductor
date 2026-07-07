@@ -63,6 +63,8 @@ _CREDENTIAL_ENV_VARS: dict[str, tuple[str, ...]] = {
     "claude-agent-sdk": ("ANTHROPIC_API_KEY",),
     "hermes": (),
     "openai-agents": (),
+    "claudebox": (),
+    "stub": (),
 }
 
 # Update-check opt-out env var (mirrors cli/update.py so diagnostics does not
@@ -232,6 +234,16 @@ def _sdk_available(name: str) -> bool:
             from conductor.providers.hermes import HERMES_SDK_AVAILABLE
 
             return HERMES_SDK_AVAILABLE
+        if name == "claudebox":
+            import shutil
+
+            # No Python SDK to import — "installed" means the `cb` CLI is
+            # locatable on PATH (the only external dependency this
+            # provider has).
+            return shutil.which("cb") is not None
+        if name == "stub":
+            # Pure-Python test double; no external dependency at all.
+            return True
     except Exception:  # noqa: BLE001 - diagnostics must never raise
         return False
     return False

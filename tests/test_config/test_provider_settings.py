@@ -241,9 +241,52 @@ class TestHermesProviderSettings:
             ProviderSettings(name="copilot", hermes_skip_context_files=True)
 
     def test_unsupported_provider_with_base_url_still_rejected(self) -> None:
-        # claude/copilot/hermes support base_url; other providers must still reject it.
+        # claude/copilot/hermes/claudebox support base_url; others still reject it.
         with pytest.raises(ValidationError, match="not yet implemented"):
             ProviderSettings(name="claude-agent-sdk", base_url="http://proxy/v1")
+
+
+class TestClaudeboxProviderSettings:
+    """claudebox reserves the auth_token/base_url slot for a future Stage-4 gateway."""
+
+    def test_auth_token_accepted_for_claudebox(self) -> None:
+        s = ProviderSettings(name="claudebox", auth_token="tok-123")
+        assert isinstance(s.auth_token, SecretStr)
+        assert s.auth_token.get_secret_value() == "tok-123"
+
+    def test_base_url_accepted_for_claudebox(self) -> None:
+        s = ProviderSettings(name="claudebox", base_url="https://gateway.example.com/v1")
+        assert s.base_url == "https://gateway.example.com/v1"
+        assert s.has_custom_routing()
+
+    def test_auth_token_rejected_for_unrelated_provider(self) -> None:
+        with pytest.raises(ValidationError, match="only supported when name='claude'"):
+            ProviderSettings(name="copilot", auth_token="tok-123")
+
+
+class TestStubProviderSettings:
+    """stub's `stub_script_path` field is stub-only and round-trips through serialization."""
+
+    def test_stub_script_path_accepted(self) -> None:
+        s = ProviderSettings(name="stub", stub_script_path="tests/fixtures/script.json")
+        assert s.stub_script_path == "tests/fixtures/script.json"
+        assert s.has_custom_routing()
+
+    def test_stub_script_path_rejected_for_non_stub(self) -> None:
+        with pytest.raises(ValidationError, match="stub_script_path"):
+            ProviderSettings(name="copilot", stub_script_path="script.json")
+
+    def test_stub_script_path_survives_serialization_round_trip(self) -> None:
+        """Regression guard: has_custom_routing() must include stub_script_path.
+
+        Without it, `_serialize`'s "collapse to bare name" optimization would
+        silently drop the field on any YAML/JSON round-trip.
+        """
+        rc = RuntimeConfig.model_validate(
+            {"provider": {"name": "stub", "stub_script_path": "script.json"}}
+        )
+        dumped = rc.model_dump(mode="json", exclude_none=True)
+        assert dumped["provider"] == {"name": "stub", "stub_script_path": "script.json"}
 
 
 class TestHasCustomRouting:

@@ -654,7 +654,9 @@ class AgentDef(BaseModel):
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
-    provider: Literal["copilot", "claude", "claude-agent-sdk", "hermes", "claudebox"] | None = None
+    provider: (
+        Literal["copilot", "claude", "claude-agent-sdk", "hermes", "claudebox", "stub"] | None
+    ) = None
     """Provider override for this agent.
 
     If None (default), the agent uses the workflow.runtime.provider.
@@ -664,6 +666,7 @@ class AgentDef(BaseModel):
     Example:
         provider: claude  # Use Claude for this agent
         provider: hermes  # Use Hermes Agent for this agent
+        provider: stub    # Use the scripted test-double provider (no LLM/box)
     """
 
     model: str | None = None
@@ -1658,7 +1661,7 @@ class ProviderSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: Literal[
-        "copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "claudebox"
+        "copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "claudebox", "stub"
     ] = "copilot"
     """SDK provider to use for agent execution."""
 
@@ -1690,13 +1693,19 @@ class ProviderSettings(BaseModel):
     Copilot-only."""
 
     auth_token: SecretStr | None = None
-    """Bearer token for OAuth / gateway authentication. Claude-only.
+    """Bearer token for OAuth / gateway authentication. Claude/claudebox-only.
 
     Sent as ``Authorization: Bearer <token>`` by the Anthropic SDK instead
     of the usual ``x-api-key`` header. Use for Databricks AI Gateway,
     LiteLLM proxies, or any endpoint that expects a bearer token.
 
     Falls back to ``ANTHROPIC_AUTH_TOKEN`` env var when not set in YAML.
+
+    For ``name: claudebox`` this is a **reserved slot** for a future
+    Stage-4 LiteLLM/gateway integration: the value (or its
+    ``ANTHROPIC_AUTH_TOKEN`` env fallback) is injected into the spawned
+    ``claude`` subprocess's environment when set, but is ``None``/unset
+    by default today — the M1 ``ClaudeboxProvider`` does not require it.
 
     Example::
 
@@ -1750,6 +1759,24 @@ class ProviderSettings(BaseModel):
     Set to ``True`` to explicitly disable context file loading.
     """
 
+    stub_script_path: str | None = None
+    """Path to a JSON script file for the ``stub`` test-double provider. Stub-only.
+
+    Maps agent/step name -> an ordered list of scripted ``AgentOutput``-shaped
+    dicts, so control-flow (retry ladders, routes, gates, resume) can be
+    exercised deterministically with no LLM/box/network. See
+    :mod:`conductor.providers.stub` for the exact file format.
+
+    Falls back to the ``CONDUCTOR_STUB_SCRIPT`` env var when not set in YAML.
+    Supports ``${ENV_VAR}`` interpolation like other path/string fields.
+
+    Example::
+
+        provider:
+          name: stub
+          stub_script_path: tests/fixtures/ladder_script.json
+    """
+
     @model_validator(mode="after")
     def _check_field_compatibility(self) -> ProviderSettings:
         copilot_only_fields = {
@@ -1759,6 +1786,10 @@ class ProviderSettings(BaseModel):
             "headers": self.headers,
             "azure": self.azure,
         }
+        # auth_token is reserved for claude today and claudebox (Stage-4
+        # gateway slot, unused by the M1 execute() path but validated here
+        # so the field is available to set ahead of time without a schema
+        # change later).
         claude_only_fields = {
             "auth_token": self.auth_token,
         }
@@ -1769,17 +1800,20 @@ class ProviderSettings(BaseModel):
                     f"Provider fields {extras} are only supported when name='copilot'. "
                     "Structured provider config for other providers is not yet implemented."
                 )
-        if self.name not in ("copilot", "claude", "hermes") and (
+        if self.name not in ("copilot", "claude", "hermes", "claudebox") and (
             self.base_url is not None or self.api_key is not None
         ):
             raise ValueError(
                 f"Structured provider config (base_url/api_key) for name='{self.name}' "
                 "is not yet implemented; use environment variables for the underlying SDK."
             )
-        if self.name != "claude":
+        if self.name not in ("claude", "claudebox"):
             extras = sorted(k for k, v in claude_only_fields.items() if v is not None)
             if extras:
-                raise ValueError(f"Provider fields {extras} are only supported when name='claude'.")
+                raise ValueError(
+                    f"Provider fields {extras} are only supported when name='claude' "
+                    "or name='claudebox'."
+                )
 
         if self.hermes_home is not None and self.name != "hermes":
             raise ValueError("'hermes_home' is only supported when name='hermes'.")
@@ -1792,6 +1826,9 @@ class ProviderSettings(BaseModel):
 
         if self.hermes_skip_context_files is not None and self.name != "hermes":
             raise ValueError("'hermes_skip_context_files' is only supported when name='hermes'.")
+
+        if self.stub_script_path is not None and self.name != "stub":
+            raise ValueError("'stub_script_path' is only supported when name='stub'.")
 
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")
@@ -1860,6 +1897,7 @@ class ProviderSettings(BaseModel):
                 self.auth_token,
                 self.headers,
                 self.azure,
+                self.stub_script_path,
             )
         )
 

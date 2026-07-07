@@ -20,13 +20,14 @@ from conductor.providers.context_tier import ContextTier
 from conductor.providers.copilot import CopilotProvider, IdleRecoveryConfig
 from conductor.providers.hermes import HERMES_SDK_AVAILABLE, HermesProvider
 from conductor.providers.reasoning import ReasoningEffort
+from conductor.providers.stub import StubProvider
 
 if TYPE_CHECKING:
     from conductor.config.schema import ProviderSettings
 
 
 ProviderType = Literal[
-    "copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "claudebox"
+    "copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "claudebox", "stub"
 ]
 
 
@@ -209,8 +210,16 @@ async def create_provider(
                 max_session_seconds=max_session_seconds,
             )
         case "claudebox":
-            # Stub registration only (M0) — execute() raises
-            # NotImplementedError until the M1 subprocess integration lands.
+            # M1: real subprocess-driving execute(). The auth_token/base_url
+            # slot is reserved for a future Stage-4 LiteLLM/gateway
+            # integration — only forwarded when the workflow explicitly
+            # configures `provider: {name: claudebox, ...}`; None by default.
+            claudebox_auth_token: str | None = None
+            claudebox_base_url: str | None = None
+            if provider_settings is not None and provider_settings.name == "claudebox":
+                if provider_settings.auth_token is not None:
+                    claudebox_auth_token = provider_settings.auth_token.get_secret_value()
+                claudebox_base_url = provider_settings.base_url
             provider = ClaudeboxProvider(
                 model=default_model,
                 temperature=temperature,
@@ -218,13 +227,20 @@ async def create_provider(
                 timeout=timeout,
                 max_agent_iterations=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
+                auth_token=claudebox_auth_token,
+                base_url=claudebox_base_url,
             )
+        case "stub":
+            stub_script_path: str | None = None
+            if provider_settings is not None and provider_settings.name == "stub":
+                stub_script_path = provider_settings.stub_script_path
+            provider = StubProvider(script_path=stub_script_path)
         case _:
             raise ProviderError(
                 f"Unknown provider: {provider_type}",
                 suggestion=(
                     "Valid providers are: copilot, openai-agents, claude, "
-                    "claude-agent-sdk, hermes, claudebox"
+                    "claude-agent-sdk, hermes, claudebox, stub"
                 ),
             )
 
