@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 
 ProviderType = Literal[
-    "copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "claudebox"
+    "copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "claudebox", "stub"
 ]
 
 
