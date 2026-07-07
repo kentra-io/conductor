@@ -292,6 +292,66 @@ class TestContextAndToolsValidation:
         with pytest.raises(ProviderError, match="requires a 'box' key"):
             await provider.execute(agent, context={}, rendered_prompt="p")
 
+    async def test_box_resolved_from_workflow_input_fallback(
+        self, fake_cb: Path, tmp_path: Path
+    ) -> None:
+        """M1b: `conductor run ... --input box=<id>` path (no top-level context key)."""
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+
+        await provider.execute(
+            agent,
+            context={"workflow": {"input": {"box": "box-from-input"}}},
+            rendered_prompt="hello",
+        )
+
+        [argv] = _read_argv_calls(tmp_path)
+        assert "box-from-input" in argv
+
+    async def test_worktree_resolved_from_workflow_input_fallback(
+        self, fake_cb: Path, tmp_path: Path
+    ) -> None:
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+
+        await provider.execute(
+            agent,
+            context={"workflow": {"input": {"box": "b", "worktree": "/wt/from/input"}}},
+            rendered_prompt="hello",
+        )
+
+        [argv] = _read_argv_calls(tmp_path)
+        assert argv[:3] == ["exec", "--workdir", "/wt/from/input"]
+
+    async def test_top_level_context_key_takes_precedence_over_workflow_input(
+        self, fake_cb: Path, tmp_path: Path
+    ) -> None:
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+
+        await provider.execute(
+            agent,
+            context={"box": "direct-box", "workflow": {"input": {"box": "input-box"}}},
+            rendered_prompt="hello",
+        )
+
+        [argv] = _read_argv_calls(tmp_path)
+        assert "direct-box" in argv
+        assert "input-box" not in argv
+
+    async def test_missing_box_raises_even_with_unrelated_workflow_input(
+        self, fake_cb: Path
+    ) -> None:
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+
+        with pytest.raises(ProviderError, match="requires a 'box' key"):
+            await provider.execute(
+                agent,
+                context={"workflow": {"input": {"topic": "vector databases"}}},
+                rendered_prompt="p",
+            )
+
     async def test_nonempty_tools_allowlist_refused(self, fake_cb: Path) -> None:
         provider = ClaudeboxProvider(cb_binary=str(fake_cb))
         agent = _make_agent()

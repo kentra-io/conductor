@@ -16,9 +16,35 @@ dict passed into :meth:`execute`):
   claudebox-provider agent runs. Missing/falsy raises :class:`ProviderError`.
 * ``context["worktree"]`` (optional, str) — absolute path of the box's
   worktree. When set, it is forwarded as ``cb exec --workdir <worktree>
-  <box> ...``. **Assumption flagged for M1b**: this assumes the real ``cb``
-  CLI accepts a ``--workdir`` flag on ``exec``; if it does not, this is the
-  one call site (:meth:`_build_argv`) that needs adjusting.
+  <box> ...``. Confirmed at M1b: the real ``cb exec`` CLI does accept a
+  ``--workdir <path>`` flag; no adjustment needed.
+
+**M1b resolution — how ``box``/``worktree`` actually get into ``context``.**
+Conductor's ``WorkflowContext.build_for_agent()`` (the only thing that
+builds the ``context`` dict this provider receives) never places a bare
+top-level key into that dict for anything other than ``workflow``/``context``
+metadata and per-step ``{"output": ...}``-wrapped entries — there is no
+declarative (YAML ``script``/``set`` step) way to land a literal
+``context["box"]``. Two supported mechanisms, in precedence order:
+
+1. **Workflow input (CLI-compatible, no embedding required).** Declare
+   ``workflow.input.box`` / ``workflow.input.worktree`` in the YAML and pass
+   them at launch: ``conductor run workflow.yaml --input box=<id> --input
+   worktree=<path>``. Every accumulate-mode ``context`` dict carries the full
+   ``workflow.input`` unconditionally (see ``_LOCAL_RENDER_AGENT_TYPES`` /
+   the non-explicit branch in ``context.py``), so this provider falls back
+   to ``context["workflow"]["input"]["box"]`` /
+   ``context["workflow"]["input"]["worktree"]`` when the flat top-level key
+   is absent. This is the mechanism used by ``conductor run`` end to end and
+   by the module's shipped workflow templates.
+2. **Direct context key (embedding only).** A caller embedding
+   ``WorkflowEngine`` directly in Python (not going through the ``conductor
+   run`` CLI) can still set ``context["box"]``/``context["worktree"]``
+   literally by wrapping/subclassing this provider's ``execute()`` and
+   injecting the keys before delegating — useful when the box id is only
+   known at Python call time and a workflow-input round-trip is undesired.
+   This path remains supported (checked first) but is not exercised by the
+   CLI-driven module templates.
 
 Two more values used by the invocation are *not* context keys:
 
@@ -460,16 +486,18 @@ class ClaudeboxProvider(AgentProvider):
     ) -> AgentOutput:
         self._check_tools(tools, agent)
 
-        box = context.get("box")
+        box = context.get("box") or self._workflow_input(context).get("box")
         if not box:
             raise ProviderError(
                 "ClaudeboxProvider requires a 'box' key in the workflow context "
-                "(the claudebox box/container id to `cb exec` into). Set it via "
-                "a `set`/`script` step or workflow input before any "
-                "claudebox-provider agent runs.",
+                "(the claudebox box/container id to `cb exec` into), or a "
+                "'box' workflow input. Set it via `conductor run ... --input "
+                "box=<id>` (declare `input.box` in the workflow YAML), or via "
+                "a `set`/`script` step / embedding-level context injection "
+                "before any claudebox-provider agent runs.",
                 is_retryable=False,
             )
-        worktree = context.get("worktree")
+        worktree = context.get("worktree") or self._workflow_input(context).get("worktree")
 
         model = agent.model or self._default_model
         timeout = self._resolve_session_timeout(agent)
@@ -574,6 +602,22 @@ class ClaudeboxProvider(AgentProvider):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _workflow_input(context: dict[str, Any]) -> dict[str, Any]:
+        """Return ``context["workflow"]["input"]``, tolerating either being absent.
+
+        See the module docstring's "M1b resolution" section: this is the
+        fallback lookup path for ``box``/``worktree`` when the workflow was
+        launched via ``conductor run ... --input box=<id> --input
+        worktree=<path>`` rather than an embedding caller setting the flat
+        top-level context keys directly.
+        """
+        workflow = context.get("workflow")
+        if not isinstance(workflow, dict):
+            return {}
+        workflow_input = workflow.get("input")
+        return workflow_input if isinstance(workflow_input, dict) else {}
 
     @staticmethod
     def _check_tools(tools: list[str] | None, agent: AgentDef) -> None:
