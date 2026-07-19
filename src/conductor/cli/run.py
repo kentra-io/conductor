@@ -1576,7 +1576,7 @@ async def run_workflow_async(
         bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
         dashboard = WebDashboard(
             emitter,
-            host="127.0.0.1",
+            host=os.environ.get("CONDUCTOR_WEB_HOST", "127.0.0.1"),
             port=web_port,
             bg=bg_mode,
             workflow_root=Path(workflow_path).resolve().parent,
@@ -2204,7 +2204,7 @@ async def resume_workflow_async(
             bg_mode = web_bg or os.environ.get("CONDUCTOR_WEB_BG") == "1"
             dashboard = WebDashboard(
                 emitter,
-                host="127.0.0.1",
+                host=os.environ.get("CONDUCTOR_WEB_HOST", "127.0.0.1"),
                 port=web_port,
                 bg=bg_mode,
                 workflow_root=resolved_workflow_path.resolve().parent,

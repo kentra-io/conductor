@@ -113,6 +113,11 @@ _DEFAULT_PARSE_RECOVERY_ATTEMPTS: Final[int] = 2
 # events (mirrors claude_agent_sdk.py's _TOOL_RESULT_PREVIEW_LEN).
 _TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
 
+# Bound on how many stray non-JSON stdout lines (CLI banners, log noise) we
+# retain per run so ProviderError can surface a tail of them on a non-zero
+# exit without holding unbounded stdout in memory.
+_NOISE_LINE_CAP: Final[int] = 20
+
 # How long to wait for the subprocess to exit after terminate() before
 # escalating to kill() — used both for interrupt and for max_session_seconds
 # timeout cleanup.
@@ -247,6 +252,20 @@ class _RunOutcome:
     partial: bool = False
     turn_count: int = 0
     pending_tools: dict[str, str] = field(default_factory=dict)
+    noise_lines: list[str] = field(default_factory=list)
+
+
+def _record_noise_line(outcome: _RunOutcome, text: str) -> None:
+    """Retain a bounded tail of stray non-JSON stdout lines on ``outcome``.
+
+    Keeps at most ``_NOISE_LINE_CAP`` lines (dropping the oldest) so a long
+    run's incidental CLI banner/log noise doesn't grow unbounded, while
+    still leaving a diagnostic tail available if the subprocess exits
+    non-zero (see the non-zero-exit ``ProviderError`` in ``_run_once``).
+    """
+    outcome.noise_lines.append(text)
+    if len(outcome.noise_lines) > _NOISE_LINE_CAP:
+        del outcome.noise_lines[: len(outcome.noise_lines) - _NOISE_LINE_CAP]
 
 
 def _process_line(
@@ -272,8 +291,10 @@ def _process_line(
         event = json.loads(text)
     except json.JSONDecodeError:
         logger.debug("Skipping non-JSON stream-json line: %r", text[:200])
+        _record_noise_line(outcome, text)
         return
     if not isinstance(event, dict):
+        _record_noise_line(outcome, text)
         return
 
     event_type = event.get("type")
@@ -771,9 +792,12 @@ class ClaudeboxProvider(AgentProvider):
 
         exit_code = process.returncode
         if exit_code != 0:
+            stdout_tail = " | ".join(
+                line.strip() for line in outcome.noise_lines[-5:] if line.strip()
+            )
+            detail = stderr_text.strip() or stdout_tail or "(no stderr or stdout diagnostics)"
             raise ProviderError(
-                f"claude subprocess exited with code {exit_code}: "
-                f"{stderr_text.strip() or '(no stderr output)'}",
+                f"claude subprocess exited with code {exit_code}: {detail}",
                 is_retryable=_classify_retryable(stderr_text, exit_code or 0),
             )
         if not outcome.saw_terminal_result:
