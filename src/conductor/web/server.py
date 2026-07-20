@@ -460,8 +460,23 @@ class WebDashboard:
         self._event_history.append(event_dict)
         self._queue.put_nowait(event_dict)
 
-        if event.type in ("workflow_completed", "workflow_failed"):
+        if event.type in ("workflow_completed", "workflow_failed") and not event_dict.get(
+            "data", {}
+        ).get("subworkflow_path"):
+            # Root-workflow terminal event only: nested sub-workflow runs emit
+            # workflow_completed too (tagged with subworkflow_path) and must
+            # not arm auto-shutdown mid-run.
             self._workflow_completed = True
+            # In --web-bg mode with no client ever connected, no disconnect
+            # will fire — start the grace timer here so an unwatched run
+            # still auto-exits. No-ops while clients remain connected.
+            # Guarded: _on_event may be called synchronously with no running
+            # event loop (e.g. emits before the server starts) where
+            # auto-shutdown is meaningless.
+            try:
+                self._maybe_start_grace_timer()
+            except RuntimeError:
+                pass
 
     # ------------------------------------------------------------------
     # Replay support (used by ``resume_workflow_async``)

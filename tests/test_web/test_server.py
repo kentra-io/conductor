@@ -164,6 +164,26 @@ class TestAutoShutdown:
         emitter.emit(_make_event("workflow_failed", error_type="Error", message="boom"))
         assert dashboard._workflow_completed is True
 
+    def test_subworkflow_completion_does_not_set_flag(self) -> None:
+        """A nested sub-workflow's workflow_completed must not arm auto-shutdown."""
+        emitter, dashboard = _make_dashboard(bg=True)
+        emitter.emit(
+            _make_event(
+                "workflow_completed", elapsed=1.0, subworkflow_path=["milestone_step"]
+            )
+        )
+        assert dashboard._workflow_completed is False
+
+    @pytest.mark.asyncio
+    async def test_unwatched_run_arms_grace_timer_on_completion(self) -> None:
+        """Root workflow_completed arms the grace timer even if no client
+        ever connected (otherwise an unwatched --web-bg run never exits)."""
+        emitter, dashboard = _make_dashboard(bg=True)
+        assert dashboard._grace_task is None
+        emitter.emit(_make_event("workflow_completed", elapsed=1.0))
+        assert dashboard._grace_task is not None
+        dashboard._grace_task.cancel()
+
     @pytest.mark.asyncio
     async def test_wait_for_clients_disconnect_resolves(self) -> None:
         """wait_for_clients_disconnect resolves after grace period."""
