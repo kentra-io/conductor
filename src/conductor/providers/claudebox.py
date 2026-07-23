@@ -118,6 +118,16 @@ _TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
 # exit without holding unbounded stdout in memory.
 _NOISE_LINE_CAP: Final[int] = 20
 
+# StreamReader buffer limit for the streaming `cb exec ... claude ...`
+# subprocess. asyncio's default is 64 KiB, but `claude --output-format
+# stream-json` emits one JSON object per line, and a single large
+# `tool_result` (big Bash/test-runner output) or file-write body easily
+# exceeds that — `readline()` then raises `ValueError: Separator is found,
+# but chunk is longer than limit` and kills the workflow. 64 MiB covers
+# realistic outputs while still bounding memory; a pathological line beyond
+# it still raises (known bound).
+_STREAM_READ_LIMIT: Final[int] = 64 * 1024 * 1024
+
 # How long to wait for the subprocess to exit after terminate() before
 # escalating to kill() — used both for interrupt and for max_session_seconds
 # timeout cleanup.
@@ -742,6 +752,7 @@ class ClaudeboxProvider(AgentProvider):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                limit=_STREAM_READ_LIMIT,
             )
         except FileNotFoundError as exc:
             raise ProviderError(
@@ -796,9 +807,26 @@ class ClaudeboxProvider(AgentProvider):
                 line.strip() for line in outcome.noise_lines[-5:] if line.strip()
             )
             detail = stderr_text.strip() or stdout_tail or "(no stderr or stdout diagnostics)"
+            # Classify against every CLI-authored signal, not stderr alone:
+            # the claude CLI prints transient failures (`API Error: Connection
+            # closed mid-response`) as plain stdout lines — retained in
+            # noise_lines — while stderr stays empty, so a stderr-only
+            # classification calls a retryable blip fatal. Deliberately NOT
+            # fed agent-generated text (content_parts/result_text): keyword-
+            # matching agent prose ("connection", "timed out", ...) would
+            # misclassify genuine failures as retryable.
+            diag = " ".join(
+                part
+                for part in (
+                    stderr_text.strip(),
+                    " ".join(line.strip() for line in outcome.noise_lines if line.strip()),
+                    (outcome.result_error_message or "").strip(),
+                )
+                if part
+            )
             raise ProviderError(
                 f"claude subprocess exited with code {exit_code}: {detail}",
-                is_retryable=_classify_retryable(stderr_text, exit_code or 0),
+                is_retryable=_classify_retryable(diag, exit_code or 0),
             )
         if not outcome.saw_terminal_result:
             raise ProviderError(

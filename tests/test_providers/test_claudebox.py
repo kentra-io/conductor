@@ -59,6 +59,36 @@ def main():
         sys.stderr.write("boom: simulated failure\\n")
         sys.exit(int(os.environ.get("FAKE_CB_EXIT_CODE", "1")))
 
+    if mode == "stdout_api_error_exit":
+        # The real claude CLI prints transient API failures as PLAIN stdout
+        # lines (not stream-json events, not stderr) before exiting non-zero.
+        print("API Error: Connection closed mid-response", flush=True)
+        sys.exit(1)
+
+    if mode == "huge_line":
+        emit({{
+            "type": "system", "subtype": "init",
+            "session_id": session_id, "model": "claude-sonnet-4-5",
+        }})
+        big = "x" * int(os.environ.get("FAKE_CB_HUGE_BYTES", str(256 * 1024)))
+        emit({{
+            "type": "assistant",
+            "message": {{
+                "role": "assistant", "model": "claude-sonnet-4-5",
+                "content": [{{"type": "text", "text": big}}],
+                "usage": {{"input_tokens": 10, "output_tokens": 5}},
+            }},
+        }})
+        emit({{
+            "type": "result", "subtype": "success", "is_error": False,
+            "result": big, "session_id": session_id, "total_cost_usd": 0.002,
+            "usage": {{
+                "input_tokens": 10, "output_tokens": 5,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+            }},
+        }})
+        sys.exit(0)
+
     emit({{
         "type": "system", "subtype": "init",
         "session_id": session_id, "model": "claude-sonnet-4-5",
@@ -471,6 +501,30 @@ class TestErrorMapping:
         finally:
             del os.environ["FAKE_CB_MODE"]
 
+    async def test_stdout_api_error_classifies_retryable(
+        self, fake_cb: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: `API Error: Connection closed mid-response` arrives as a
+        plain stdout line with EMPTY stderr; a stderr-only classification called
+        this transient failure fatal and killed a 6/7-milestones live run."""
+        monkeypatch.setenv("FAKE_CB_MODE", "stdout_api_error_exit")
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+        with pytest.raises(ProviderError) as excinfo:
+            await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
+        assert excinfo.value.is_retryable is True
+        assert "API Error: Connection closed" in str(excinfo.value)
+
+    async def test_stderr_failure_without_transient_signal_stays_non_retryable(
+        self, fake_cb: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FAKE_CB_MODE", "error_exit")
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+        with pytest.raises(ProviderError) as excinfo:
+            await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
+        assert excinfo.value.is_retryable is False
+
     async def test_cb_binary_missing_raises_provider_error(self, tmp_path: Path) -> None:
         provider = ClaudeboxProvider(cb_binary=str(tmp_path / "no-such-cb-binary"))
         agent = _make_agent()
@@ -511,6 +565,22 @@ class TestInterrupt:
         finally:
             del os.environ["FAKE_CB_MODE"]
             del os.environ["FAKE_CB_SLEEP_SECONDS"]
+
+
+class TestStreamLimit:
+    async def test_streams_single_line_larger_than_64kib(
+        self, fake_cb: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: `claude --output-format stream-json` emits one JSON
+        object per line; a single large tool_result/file-write body exceeded
+        asyncio's default 64 KiB StreamReader limit, so `readline()` raised
+        `ValueError: Separator is found, but chunk is longer than limit` and
+        killed the workflow mid-milestone."""
+        monkeypatch.setenv("FAKE_CB_MODE", "huge_line")
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+        output = await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
+        assert len(output.content["response"]) > 64 * 1024
 
 
 class TestValidateConnection:
