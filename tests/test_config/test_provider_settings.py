@@ -263,6 +263,26 @@ class TestClaudeboxProviderSettings:
         with pytest.raises(ValidationError, match="only supported when name='claude'"):
             ProviderSettings(name="copilot", auth_token="tok-123")
 
+    def test_claudebox_stall_timeout_seconds_field(self) -> None:
+        settings = ProviderSettings(name="claudebox", stall_timeout_seconds=120)
+        assert settings.stall_timeout_seconds == 120.0
+
+    def test_stall_timeout_seconds_rejected_for_unrelated_provider(self) -> None:
+        with pytest.raises(ValidationError, match="only supported when name='claudebox'"):
+            ProviderSettings(name="copilot", stall_timeout_seconds=120)
+
+    def test_stall_timeout_seconds_survives_serialization_round_trip(self) -> None:
+        """Regression guard: has_custom_routing() must include stall_timeout_seconds.
+
+        Without it, `_serialize`'s "collapse to bare name" optimization would
+        silently drop the field on any YAML/JSON round-trip.
+        """
+        rc = RuntimeConfig.model_validate(
+            {"provider": {"name": "claudebox", "stall_timeout_seconds": 120}}
+        )
+        dumped = rc.model_dump(mode="json", exclude_none=True)
+        assert dumped["provider"] == {"name": "claudebox", "stall_timeout_seconds": 120.0}
+
 
 class TestStubProviderSettings:
     """stub's `stub_script_path` field is stub-only and round-trips through serialization."""

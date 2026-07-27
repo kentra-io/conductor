@@ -1715,6 +1715,16 @@ class ProviderSettings(BaseModel):
           auth_token: ${DATABRICKS_TOKEN}
     """
 
+    stall_timeout_seconds: float | None = None
+    """Stall-watchdog threshold in seconds. Claudebox-only.
+
+    When the spawned ``claude`` subprocess emits no stdout line for this
+    long, it is terminated and a *retryable* ProviderError is raised (a
+    workflow ``retry: [provider_error]`` then restarts the step). Defaults
+    to the ``CONDUCTOR_CLAUDEBOX_STALL_SECONDS`` env var, then 600. Values
+    <= 0 disable the watchdog. See ClaudeboxProvider for details.
+    """
+
     headers: dict[str, str] | None = None
     """Extra HTTP headers to send with every request. Copilot-only."""
 
@@ -1830,6 +1840,9 @@ class ProviderSettings(BaseModel):
         if self.stub_script_path is not None and self.name != "stub":
             raise ValueError("'stub_script_path' is only supported when name='stub'.")
 
+        if self.stall_timeout_seconds is not None and self.name != "claudebox":
+            raise ValueError("'stall_timeout_seconds' is only supported when name='claudebox'.")
+
         if self.azure is not None and self.type != "azure":
             raise ValueError("'azure' options require type='azure'")
 
@@ -1898,6 +1911,7 @@ class ProviderSettings(BaseModel):
                 self.headers,
                 self.azure,
                 self.stub_script_path,
+                self.stall_timeout_seconds,
             )
         )
 

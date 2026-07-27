@@ -216,10 +216,12 @@ async def create_provider(
             # configures `provider: {name: claudebox, ...}`; None by default.
             claudebox_auth_token: str | None = None
             claudebox_base_url: str | None = None
+            claudebox_stall: float | None = None
             if provider_settings is not None and provider_settings.name == "claudebox":
                 if provider_settings.auth_token is not None:
                     claudebox_auth_token = provider_settings.auth_token.get_secret_value()
                 claudebox_base_url = provider_settings.base_url
+                claudebox_stall = provider_settings.stall_timeout_seconds
             provider = ClaudeboxProvider(
                 model=default_model,
                 temperature=temperature,
@@ -229,6 +231,7 @@ async def create_provider(
                 max_session_seconds=max_session_seconds,
                 auth_token=claudebox_auth_token,
                 base_url=claudebox_base_url,
+                stall_timeout_seconds=claudebox_stall,
             )
         case "stub":
             stub_script_path: str | None = None

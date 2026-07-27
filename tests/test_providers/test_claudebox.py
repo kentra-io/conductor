@@ -871,6 +871,16 @@ class TestStallWatchdog:
         provider = ClaudeboxProvider(cb_binary="cb")
         assert provider._stall_timeout == 600.0
 
+    async def test_factory_forwards_stall_timeout_to_claudebox_provider(self) -> None:
+        from conductor.config.schema import ProviderSettings
+        from conductor.providers.factory import create_provider
+
+        settings = ProviderSettings(name="claudebox", stall_timeout_seconds=42)
+        provider = await create_provider(
+            provider_type="claudebox", validate=False, provider_settings=settings
+        )
+        assert provider._stall_timeout == 42.0
+
 
 class TestPartialMessages:
     async def test_stream_event_lines_are_ignored_not_noise(self, tmp_path: Path) -> None:
