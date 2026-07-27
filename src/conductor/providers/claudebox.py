@@ -227,6 +227,13 @@ def _classify_retryable(text: str, exit_code: int) -> bool:
     """
     del exit_code  # kept for signature symmetry / future use
     t = text.lower()
+    # OAuth/session-expiry failures first, ahead of the retryable keyword
+    # groups below: a message like "OAuth session expired ... connection"
+    # must not be classified retryable just because "connection" also
+    # appears in it (kentra-io/harness#3 — a dead box's expired session
+    # churned through 3 retry layers for ~52 minutes before this fix).
+    if any(k in t for k in ("oauth", "session expired", "could not be refreshed")):
+        return False
     if any(k in t for k in ("unauthorized", "401", "403", "invalid api key", "authentication")):
         return False
     if any(k in t for k in ("429", "rate limit", "quota", "overloaded")):
@@ -276,6 +283,34 @@ def _record_noise_line(outcome: _RunOutcome, text: str) -> None:
     outcome.noise_lines.append(text)
     if len(outcome.noise_lines) > _NOISE_LINE_CAP:
         del outcome.noise_lines[: len(outcome.noise_lines) - _NOISE_LINE_CAP]
+
+
+def _diagnostic_tails(outcome: _RunOutcome) -> tuple[str, str]:
+    """Bounded stdout-noise and agent-content tails, shared by detail + classification.
+
+    Kept as one source of truth so the non-zero-exit ``ProviderError`` in
+    ``_run_once`` can both report and classify against the same evidence.
+    """
+    stdout_tail = " | ".join(line.strip() for line in outcome.noise_lines[-5:] if line.strip())
+    content_tail = " | ".join(p.strip() for p in outcome.content_parts[-3:] if p.strip())[-500:]
+    return stdout_tail, content_tail
+
+
+def _nonzero_exit_detail(stderr_text: str, outcome: _RunOutcome) -> str:
+    """Best-effort diagnostic for a non-zero ``claude`` subprocess exit.
+
+    Falls back through stderr, then a bounded tail of stray stdout noise
+    lines, then a tail of agent-message text content: a dead box's OAuth
+    session expiry surfaces only there (empty stderr, no stdout noise, the
+    failure text is the agent's last message — kentra-io/harness#3).
+    """
+    stdout_tail, content_tail = _diagnostic_tails(outcome)
+    return (
+        stderr_text.strip()
+        or stdout_tail
+        or content_tail
+        or "(no stderr, stdout, or agent-content diagnostics)"
+    )
 
 
 def _process_line(
@@ -803,30 +838,27 @@ class ClaudeboxProvider(AgentProvider):
 
         exit_code = process.returncode
         if exit_code != 0:
-            stdout_tail = " | ".join(
-                line.strip() for line in outcome.noise_lines[-5:] if line.strip()
-            )
-            detail = stderr_text.strip() or stdout_tail or "(no stderr or stdout diagnostics)"
-            # Classify against every CLI-authored signal, not stderr alone:
-            # the claude CLI prints transient failures (`API Error: Connection
-            # closed mid-response`) as plain stdout lines — retained in
-            # noise_lines — while stderr stays empty, so a stderr-only
-            # classification calls a retryable blip fatal. Deliberately NOT
-            # fed agent-generated text (content_parts/result_text): keyword-
-            # matching agent prose ("connection", "timed out", ...) would
-            # misclassify genuine failures as retryable.
-            diag = " ".join(
-                part
-                for part in (
-                    stderr_text.strip(),
-                    " ".join(line.strip() for line in outcome.noise_lines if line.strip()),
-                    (outcome.result_error_message or "").strip(),
-                )
-                if part
-            )
+            # Classify against every CLI-authored signal, not stderr alone —
+            # this mirrors ab0ff4c's original `diag` (stderr + ALL retained
+            # noise_lines + result_error_message), widened further to also
+            # include the agent-content tail: a dead box's OAuth session
+            # expiry surfaces only as agent *message content* (stdout JSON)
+            # with stderr/noise/result all empty — kentra-io/harness#3. Note
+            # this deliberately reads the FULL noise_lines here, not just the
+            # bounded tail `_diagnostic_tails`/`detail` use for the reported
+            # message — a transient signal earlier than the last 5 lines must
+            # still be classifiable even if it's not worth quoting in full.
+            # `_classify_retryable` checks OAuth/session patterns first so
+            # this combined text can't be misclassified retryable by an
+            # incidental keyword like "connection".
+            _, content_tail = _diagnostic_tails(outcome)
+            detail = _nonzero_exit_detail(stderr_text, outcome)
+            noise_all = " | ".join(line.strip() for line in outcome.noise_lines if line.strip())
+            result_error = outcome.result_error_message or ""
+            classify_text = f"{stderr_text}\n{noise_all}\n{content_tail}\n{result_error}"
             raise ProviderError(
                 f"claude subprocess exited with code {exit_code}: {detail}",
-                is_retryable=_classify_retryable(diag, exit_code or 0),
+                is_retryable=_classify_retryable(classify_text, exit_code or 0),
             )
         if not outcome.saw_terminal_result:
             raise ProviderError(

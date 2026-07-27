@@ -21,7 +21,12 @@ import pytest
 
 from conductor.config.schema import AgentDef, OutputField
 from conductor.exceptions import ProviderError, ValidationError
-from conductor.providers.claudebox import ClaudeboxProvider
+from conductor.providers.claudebox import (
+    ClaudeboxProvider,
+    _classify_retryable,
+    _nonzero_exit_detail,
+    _RunOutcome,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -65,6 +70,20 @@ def main():
         print("API Error: Connection closed mid-response", flush=True)
         sys.exit(1)
 
+    if mode == "stderr_benign_plus_stdout_connection_exit":
+        # Non-empty stderr with NO transient signal, plus a stdout noise line
+        # that DOES carry one. Classification must still see the noise tail
+        # even though stderr alone would otherwise satisfy `detail`.
+        print("API Error: Connection closed mid-response", flush=True)
+        sys.stderr.write("boom: simulated failure\\n")
+        sys.exit(1)
+
+    if mode == "stdout_oauth_and_connection_exit":
+        # OAuth text and a retryable keyword in the SAME stdout noise line;
+        # the OAuth check must still win.
+        print("OAuth session expired ... connection", flush=True)
+        sys.exit(1)
+
     if mode == "huge_line":
         emit({{
             "type": "system", "subtype": "init",
@@ -101,12 +120,45 @@ def main():
         }})
         sys.exit(0)
 
+    if mode == "oauth_content_nonzero_exit":
+        # The exact incident shape (kentra-io/harness#3): a dead box's OAuth
+        # failure never reaches stderr or a terminal `result` event — it's
+        # the text of the last assistant message, immediately followed by a
+        # non-zero exit. Empty stderr, no stdout noise.
+        emit({{
+            "type": "assistant",
+            "message": {{
+                "role": "assistant", "model": "claude-sonnet-4-5",
+                "content": [{{
+                    "type": "text",
+                    "text": (
+                        "Failed to authenticate: OAuth session expired "
+                        "and could not be refreshed"
+                    ),
+                }}],
+                "usage": {{"input_tokens": 10, "output_tokens": 5}},
+            }},
+        }})
+        sys.exit(1)
+
     if mode == "result_error":
         emit({{
             "type": "result", "subtype": "error", "is_error": True,
             "result": "simulated model error", "session_id": session_id,
         }})
         sys.exit(0)
+
+    if mode == "result_error_retryable_nonzero_exit":
+        # Edge case: a terminal `result` event carries a retryable signal in
+        # result_error_message, AND the process also exits non-zero (so the
+        # exit_code!=0 branch preempts the result_is_error branch). Stderr
+        # and stdout noise are both empty — classification must still see
+        # result_error_message, mirroring ab0ff4c's original `diag`.
+        emit({{
+            "type": "result", "subtype": "error", "is_error": True,
+            "result": "API Error: 429 rate limit exceeded", "session_id": session_id,
+        }})
+        sys.exit(1)
 
     if mode in ("structured", "structured_always_invalid"):
         resumed = "--resume" in argv
@@ -525,11 +577,109 @@ class TestErrorMapping:
             await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
         assert excinfo.value.is_retryable is False
 
+    async def test_nonempty_stderr_still_classifies_via_stdout_noise_tail(
+        self, fake_cb: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guards against narrowing classification to `detail`'s fallback chain:
+        stderr is non-empty (so `detail` resolves from stderr alone) but carries
+        no transient signal itself — the retryable keyword only appears in a
+        stdout noise line. Classification must still see it (ab0ff4c's
+        stdout-aware fix must survive alongside the OAuth check)."""
+        monkeypatch.setenv("FAKE_CB_MODE", "stderr_benign_plus_stdout_connection_exit")
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+        with pytest.raises(ProviderError) as excinfo:
+            await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
+        assert excinfo.value.is_retryable is True
+
+    async def test_oauth_in_stdout_noise_wins_over_connection_keyword(
+        self, fake_cb: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Inverse guard: OAuth text anywhere in the combined classification
+        input (here, a stdout noise line) must still classify non-retryable
+        even when "connection" appears in that same line."""
+        monkeypatch.setenv("FAKE_CB_MODE", "stdout_oauth_and_connection_exit")
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+        with pytest.raises(ProviderError) as excinfo:
+            await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
+        assert excinfo.value.is_retryable is False
+
+    async def test_result_error_message_still_feeds_classification_on_nonzero_exit(
+        self, fake_cb: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guards against narrowing classification away from ab0ff4c's
+        original `diag` inputs: a terminal `result` event carries a
+        retryable signal in `result_error_message`, but the process ALSO
+        exits non-zero — so the exit_code!=0 branch (not the result_is_error
+        branch) is what raises. Stderr and stdout noise are both empty;
+        classification must still see result_error_message."""
+        monkeypatch.setenv("FAKE_CB_MODE", "result_error_retryable_nonzero_exit")
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+        with pytest.raises(ProviderError) as excinfo:
+            await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
+        assert excinfo.value.is_retryable is True
+
+    async def test_oauth_content_nonzero_exit_end_to_end(
+        self, fake_cb: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The incident's exact shape (kentra-io/harness#3): an assistant
+        message carries the OAuth failure as text content, immediately
+        followed by a non-zero exit — no stderr, no stdout noise, no
+        terminal `result` event. Proves the fix end-to-end: the content
+        tail surfaces in the error message AND classifies non-retryable."""
+        monkeypatch.setenv("FAKE_CB_MODE", "oauth_content_nonzero_exit")
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+        with pytest.raises(ProviderError) as excinfo:
+            await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
+        assert excinfo.value.is_retryable is False
+        assert "OAuth session expired" in str(excinfo.value)
+
     async def test_cb_binary_missing_raises_provider_error(self, tmp_path: Path) -> None:
         provider = ClaudeboxProvider(cb_binary=str(tmp_path / "no-such-cb-binary"))
         agent = _make_agent()
         with pytest.raises(ProviderError, match="claudebox CLI not found"):
             await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
+
+
+class TestClassifyRetryableOAuth:
+    """Regression: a dead box's OAuth session-expiry surfaced as agent-message
+    stream *content* (stdout JSON), not stderr, so it fell through to the
+    generic retryable default and four stacked retry layers churned for ~52
+    minutes on an unrecoverable failure (kentra-io/harness#3)."""
+
+    async def test_oauth_expired_not_retryable(self) -> None:
+        assert (
+            _classify_retryable(
+                "Failed to authenticate: OAuth session expired and could not be refreshed", 1
+            )
+            is False
+        )
+        assert _classify_retryable("OAuth token has expired", 1) is False
+        assert _classify_retryable("credentials could not be refreshed", 1) is False
+        assert (
+            _classify_retryable(
+                "Failed to authenticate. API Error: 401 OAuth access token is invalid.", 1
+            )
+            is False
+        )
+
+    async def test_oauth_expired_wins_over_retryable_connection_keyword(self) -> None:
+        """`"connection"` alone classifies retryable; the OAuth check must win
+        even when a retryable keyword also appears in the same message."""
+        assert _classify_retryable("OAuth session expired ... connection", 1) is False
+
+    async def test_nonzero_exit_detail_includes_content_parts(self) -> None:
+        """When stderr and stdout noise are both empty, the only diagnostic is
+        agent text content — the incident shape — so it must surface."""
+        outcome = _RunOutcome()
+        outcome.content_parts.append(
+            "Failed to authenticate: OAuth session expired and could not be refreshed"
+        )
+        detail = _nonzero_exit_detail("", outcome)
+        assert "OAuth session expired" in detail
 
 
 class TestInterrupt:
