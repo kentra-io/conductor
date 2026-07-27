@@ -109,6 +109,26 @@ _CB_PATH_ENV_VAR: Final[str] = "CONDUCTOR_CLAUDEBOX_CB_PATH"
 # providers/claude.py's RetryConfig.max_parse_recovery_attempts default.
 _DEFAULT_PARSE_RECOVERY_ATTEMPTS: Final[int] = 2
 
+# Stall watchdog: kill-and-raise-retryable when the `claude` subprocess
+# produces NO stdout line for this long. stream-json emits per-turn; with
+# `--include-partial-messages` (always passed, see _build_argv) it emits
+# token-granular `stream_event` deltas, so silence past the threshold means
+# a genuinely dead session (expired auth, wedged exec, network stall) -- the
+# class of failure that hung real runs for 46-245 minutes unbounded.
+# Retryable=True on purpose: workflow-level `retry: [provider_error]`
+# restarts the step WITHOUT burning an escalation-ladder attempt.
+_DEFAULT_STALL_SECONDS: Final[float] = 600.0
+_STALL_ENV_VAR: Final[str] = "CONDUCTOR_CLAUDEBOX_STALL_SECONDS"
+
+
+class _StallTimeoutError(Exception):
+    """Internal: _read_loop saw no stdout line within the stall threshold."""
+
+    def __init__(self, threshold: float) -> None:
+        super().__init__(f"no stream output for {threshold:.0f}s")
+        self.threshold = threshold
+
+
 # Preview length for tool_result content forwarded in agent_tool_complete
 # events (mirrors claude_agent_sdk.py's _TOOL_RESULT_PREVIEW_LEN).
 _TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
@@ -499,6 +519,7 @@ class ClaudeboxProvider(AgentProvider):
         auth_token: str | None = None,
         base_url: str | None = None,
         cb_binary: str | None = None,
+        stall_timeout_seconds: float | None = None,
     ) -> None:
         """Initialize the claudebox provider.
 
@@ -528,6 +549,13 @@ class ClaudeboxProvider(AgentProvider):
                 to the `CONDUCTOR_CLAUDEBOX_CB_PATH` env var, then the bare
                 name `"cb"` (resolved via `PATH`). Exists primarily so tests
                 can point this provider at a fake `cb` script.
+            stall_timeout_seconds: Inactivity watchdog -- if the claude
+                subprocess emits no stdout line for this many seconds the
+                subprocess is terminated and a retryable ProviderError is
+                raised. Defaults to the CONDUCTOR_CLAUDEBOX_STALL_SECONDS
+                env var, then 600. Values <= 0 disable the watchdog.
+                Distinct from `max_session_seconds` (total wall-clock cap):
+                the watchdog bounds *silence*, not total duration.
         """
         self._default_model = model or _DEFAULT_MODEL
         self._default_temperature = temperature
@@ -538,6 +566,13 @@ class ClaudeboxProvider(AgentProvider):
         self._auth_token = auth_token
         self._base_url = base_url
         self._cb_binary = cb_binary or os.environ.get(_CB_PATH_ENV_VAR) or _DEFAULT_CB_BINARY
+        if stall_timeout_seconds is None:
+            env_val = os.environ.get(_STALL_ENV_VAR)
+            stall_timeout_seconds = float(env_val) if env_val else _DEFAULT_STALL_SECONDS
+        # <= 0 disables the watchdog entirely.
+        self._stall_timeout: float | None = (
+            stall_timeout_seconds if stall_timeout_seconds > 0 else None
+        )
 
     # ------------------------------------------------------------------
     # AgentProvider interface
@@ -827,16 +862,28 @@ class ClaudeboxProvider(AgentProvider):
         try:
             if timeout is not None:
                 outcome = await asyncio.wait_for(
-                    self._read_loop(process, interrupt_signal, event_callback), timeout=timeout
+                    self._read_loop(process, interrupt_signal, event_callback, self._stall_timeout),
+                    timeout=timeout,
                 )
             else:
-                outcome = await self._read_loop(process, interrupt_signal, event_callback)
+                outcome = await self._read_loop(
+                    process, interrupt_signal, event_callback, self._stall_timeout
+                )
         except TimeoutError:
             await self._terminate(process)
             stderr_task.cancel()
             raise ProviderError(
                 f"claudebox agent exceeded max_session_seconds={timeout:.0f}s",
                 is_retryable=False,
+            ) from None
+        except _StallTimeoutError as exc:
+            await self._terminate(process)
+            stderr_task.cancel()
+            raise ProviderError(
+                f"claudebox agent stalled: no stream-json output for "
+                f"{exc.threshold:.0f}s (stall watchdog; configure via "
+                f"provider stall_timeout_seconds or {_STALL_ENV_VAR}; <=0 disables)",
+                is_retryable=True,
             ) from None
         except asyncio.CancelledError:
             await self._terminate(process)
@@ -898,8 +945,14 @@ class ClaudeboxProvider(AgentProvider):
         process: asyncio.subprocess.Process,
         interrupt_signal: asyncio.Event | None,
         event_callback: EventCallback | None,
+        stall_timeout: float | None = None,
     ) -> _RunOutcome:
-        """Read `stream-json` lines until EOF or `interrupt_signal` fires."""
+        """Read `stream-json` lines until EOF or `interrupt_signal` fires.
+
+        Raises `_StallTimeoutError` if `stall_timeout` is set and no stdout
+        line (nor an interrupt) arrives within that many seconds -- see the
+        module-level `_DEFAULT_STALL_SECONDS` comment for rationale.
+        """
         outcome = _RunOutcome()
         assert process.stdout is not None
 
@@ -912,11 +965,20 @@ class ClaudeboxProvider(AgentProvider):
                 waiters.add(interrupt_task)
 
             try:
-                done, pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                done, pending = await asyncio.wait(
+                    waiters, timeout=stall_timeout, return_when=asyncio.FIRST_COMPLETED
+                )
             except asyncio.CancelledError:
                 for t in waiters:
                     t.cancel()
                 raise
+
+            if not done:
+                # Stall: neither a stdout line nor an interrupt within the
+                # threshold. Cancel waiters and let _run_once terminate.
+                for t in pending:
+                    t.cancel()
+                raise _StallTimeoutError(stall_timeout)  # type: ignore[arg-type]
 
             for t in pending:
                 t.cancel()

@@ -835,3 +835,36 @@ class TestClose:
     async def test_close_is_a_no_op(self, fake_cb: Path) -> None:
         provider = ClaudeboxProvider(cb_binary=str(fake_cb))
         await provider.close()  # must not raise
+
+
+class TestStallWatchdog:
+    async def test_stall_kills_subprocess_and_raises_retryable(self, tmp_path: Path) -> None:
+        """No stdout for longer than the threshold -> retryable ProviderError."""
+        script = tmp_path / "cb"
+        script.write_text(
+            "#!/bin/bash\n"
+            'echo \'{"type":"system","subtype":"init","session_id":"s1","model":"m"}\'\n'
+            "sleep 30\n"
+        )
+        script.chmod(0o755)
+        provider = ClaudeboxProvider(cb_binary=str(script), stall_timeout_seconds=0.5)
+        agent = _make_agent()
+        with pytest.raises(ProviderError, match="stall") as exc_info:
+            await provider.execute(
+                agent, context={"box": "b", "worktree": str(tmp_path)}, rendered_prompt="p"
+            )
+        assert exc_info.value.is_retryable is True
+
+    def test_zero_threshold_disables_watchdog(self) -> None:
+        provider = ClaudeboxProvider(cb_binary="cb", stall_timeout_seconds=0)
+        assert provider._stall_timeout is None
+
+    def test_env_var_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CONDUCTOR_CLAUDEBOX_STALL_SECONDS", "120")
+        provider = ClaudeboxProvider(cb_binary="cb")
+        assert provider._stall_timeout == 120.0
+
+    def test_builtin_default_is_600(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONDUCTOR_CLAUDEBOX_STALL_SECONDS", raising=False)
+        provider = ClaudeboxProvider(cb_binary="cb")
+        assert provider._stall_timeout == 600.0
