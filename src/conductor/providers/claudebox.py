@@ -819,6 +819,12 @@ class ClaudeboxProvider(AgentProvider):
             "--output-format",
             "stream-json",
             "--verbose",
+            # Token-granular liveness for the stall watchdog: emits
+            # `stream_event` delta lines DURING generation, so a long
+            # thinking turn resets the watchdog instead of tripping it
+            # (measured legit inter-turn silences reach ~5 min without it).
+            # _process_line ignores the unknown type by design.
+            "--include-partial-messages",
         ]
         return argv
 

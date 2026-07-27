@@ -25,6 +25,7 @@ from conductor.providers.claudebox import (
     ClaudeboxProvider,
     _classify_retryable,
     _nonzero_exit_detail,
+    _process_line,
     _RunOutcome,
 )
 
@@ -364,6 +365,7 @@ class TestExecuteNormalRun:
             "--output-format",
             "stream-json",
             "--verbose",
+            "--include-partial-messages",
         ]
 
     async def test_worktree_adds_workdir_flag(self, fake_cb: Path, tmp_path: Path) -> None:
@@ -868,3 +870,50 @@ class TestStallWatchdog:
         monkeypatch.delenv("CONDUCTOR_CLAUDEBOX_STALL_SECONDS", raising=False)
         provider = ClaudeboxProvider(cb_binary="cb")
         assert provider._stall_timeout == 600.0
+
+
+class TestPartialMessages:
+    async def test_stream_event_lines_are_ignored_not_noise(self, tmp_path: Path) -> None:
+        """`stream_event` delta lines (from --include-partial-messages) must be
+        silently skipped: no agent_message events, no noise recording, and the
+        terminal result still parses."""
+        script = tmp_path / "cb"
+        script.write_text(
+            "#!/bin/bash\n"
+            'echo \'{"type":"system","subtype":"init","session_id":"s1","model":"m"}\'\n'
+            'echo \'{"type":"stream_event","event":{"type":"content_block_delta",'
+            '"delta":{"type":"text_delta","text":"chunk"}}}\'\n'
+            'echo \'{"type":"result","is_error":false,"result":"done",'
+            '"session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}\'\n'
+        )
+        script.chmod(0o755)
+        provider = ClaudeboxProvider(cb_binary=str(script))
+        agent = _make_agent()
+        events: list[tuple[str, dict]] = []
+        output = await provider.execute(
+            agent,
+            context={"box": "b", "worktree": str(tmp_path)},
+            rendered_prompt="p",
+            event_callback=lambda t, d: events.append((t, d)),
+        )
+        assert output.raw_response["result"] == "done"
+        assert not any(t == "agent_message" for t, _ in events)
+
+    def test_process_line_stream_event_has_no_side_effects(self) -> None:
+        """Direct unit test on `_process_line`: a `stream_event` delta line
+        must not be recorded as noise, must not emit any callback event, and
+        must not perturb content/turn-count state -- it's an unrecognized
+        type that `_process_line` is documented to skip entirely."""
+        outcome = _RunOutcome()
+        emitted: list[tuple[str, dict]] = []
+        line = (
+            b'{"type":"stream_event","event":{"type":"content_block_delta",'
+            b'"delta":{"type":"text_delta","text":"chunk"}}}'
+        )
+
+        _process_line(outcome, line, lambda t, d: emitted.append((t, d)))
+
+        assert outcome.noise_lines == []
+        assert emitted == []
+        assert outcome.content_parts == []
+        assert outcome.turn_count == 0
