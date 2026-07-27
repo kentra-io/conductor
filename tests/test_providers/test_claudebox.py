@@ -25,6 +25,7 @@ from conductor.providers.claudebox import (
     ClaudeboxProvider,
     _classify_retryable,
     _nonzero_exit_detail,
+    _process_line,
     _RunOutcome,
 )
 
@@ -364,6 +365,7 @@ class TestExecuteNormalRun:
             "--output-format",
             "stream-json",
             "--verbose",
+            "--include-partial-messages",
         ]
 
     async def test_worktree_adds_workdir_flag(self, fake_cb: Path, tmp_path: Path) -> None:
@@ -835,3 +837,93 @@ class TestClose:
     async def test_close_is_a_no_op(self, fake_cb: Path) -> None:
         provider = ClaudeboxProvider(cb_binary=str(fake_cb))
         await provider.close()  # must not raise
+
+
+class TestStallWatchdog:
+    async def test_stall_kills_subprocess_and_raises_retryable(self, tmp_path: Path) -> None:
+        """No stdout for longer than the threshold -> retryable ProviderError."""
+        script = tmp_path / "cb"
+        script.write_text(
+            "#!/bin/bash\n"
+            'echo \'{"type":"system","subtype":"init","session_id":"s1","model":"m"}\'\n'
+            "sleep 30\n"
+        )
+        script.chmod(0o755)
+        provider = ClaudeboxProvider(cb_binary=str(script), stall_timeout_seconds=0.5)
+        agent = _make_agent()
+        with pytest.raises(ProviderError, match="stall") as exc_info:
+            await provider.execute(
+                agent, context={"box": "b", "worktree": str(tmp_path)}, rendered_prompt="p"
+            )
+        assert exc_info.value.is_retryable is True
+
+    def test_zero_threshold_disables_watchdog(self) -> None:
+        provider = ClaudeboxProvider(cb_binary="cb", stall_timeout_seconds=0)
+        assert provider._stall_timeout is None
+
+    def test_env_var_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CONDUCTOR_CLAUDEBOX_STALL_SECONDS", "120")
+        provider = ClaudeboxProvider(cb_binary="cb")
+        assert provider._stall_timeout == 120.0
+
+    def test_builtin_default_is_600(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CONDUCTOR_CLAUDEBOX_STALL_SECONDS", raising=False)
+        provider = ClaudeboxProvider(cb_binary="cb")
+        assert provider._stall_timeout == 600.0
+
+    async def test_factory_forwards_stall_timeout_to_claudebox_provider(self) -> None:
+        from conductor.config.schema import ProviderSettings
+        from conductor.providers.factory import create_provider
+
+        settings = ProviderSettings(name="claudebox", stall_timeout_seconds=42)
+        provider = await create_provider(
+            provider_type="claudebox", validate=False, provider_settings=settings
+        )
+        assert provider._stall_timeout == 42.0
+
+
+class TestPartialMessages:
+    async def test_stream_event_lines_are_ignored_not_noise(self, tmp_path: Path) -> None:
+        """`stream_event` delta lines (from --include-partial-messages) must be
+        silently skipped: no agent_message events, no noise recording, and the
+        terminal result still parses."""
+        script = tmp_path / "cb"
+        script.write_text(
+            "#!/bin/bash\n"
+            'echo \'{"type":"system","subtype":"init","session_id":"s1","model":"m"}\'\n'
+            'echo \'{"type":"stream_event","event":{"type":"content_block_delta",'
+            '"delta":{"type":"text_delta","text":"chunk"}}}\'\n'
+            'echo \'{"type":"result","is_error":false,"result":"done",'
+            '"session_id":"s1","usage":{"input_tokens":1,"output_tokens":1}}\'\n'
+        )
+        script.chmod(0o755)
+        provider = ClaudeboxProvider(cb_binary=str(script))
+        agent = _make_agent()
+        events: list[tuple[str, dict]] = []
+        output = await provider.execute(
+            agent,
+            context={"box": "b", "worktree": str(tmp_path)},
+            rendered_prompt="p",
+            event_callback=lambda t, d: events.append((t, d)),
+        )
+        assert output.raw_response["result"] == "done"
+        assert not any(t == "agent_message" for t, _ in events)
+
+    def test_process_line_stream_event_has_no_side_effects(self) -> None:
+        """Direct unit test on `_process_line`: a `stream_event` delta line
+        must not be recorded as noise, must not emit any callback event, and
+        must not perturb content/turn-count state -- it's an unrecognized
+        type that `_process_line` is documented to skip entirely."""
+        outcome = _RunOutcome()
+        emitted: list[tuple[str, dict]] = []
+        line = (
+            b'{"type":"stream_event","event":{"type":"content_block_delta",'
+            b'"delta":{"type":"text_delta","text":"chunk"}}}'
+        )
+
+        _process_line(outcome, line, lambda t, d: emitted.append((t, d)))
+
+        assert outcome.noise_lines == []
+        assert emitted == []
+        assert outcome.content_parts == []
+        assert outcome.turn_count == 0
