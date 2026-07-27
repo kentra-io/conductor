@@ -69,6 +69,21 @@ Not yet implemented / left for the live-box pass (M1b):
 * Workflow ``tools:`` allowlists are refused loudly (not silently dropped) —
   tool access inside the box is governed by the box's own claude
   configuration/persona, not Conductor's per-agent ``tools:`` field.
+
+Stall watchdog. The provider kills a ``claude`` subprocess that produces no
+stdout for ``stall_timeout_seconds`` (default **600**; env override
+``CONDUCTOR_CLAUDEBOX_STALL_SECONDS``; ``<= 0`` disables) and raises a
+**retryable** :class:`ProviderError` — a workflow ``retry:
+[provider_error]`` restarts the step without consuming an
+escalation-ladder attempt. Liveness is token-granular: the invocation
+always passes ``--include-partial-messages``, so long thinking turns emit
+delta lines and do not trip the watchdog. This is distinct from
+``max_session_seconds``, which caps *total* duration. Example::
+
+    runtime:
+      provider:
+        name: claudebox
+        stall_timeout_seconds: 600
 """
 
 from __future__ import annotations
