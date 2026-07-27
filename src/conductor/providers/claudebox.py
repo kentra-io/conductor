@@ -286,10 +286,12 @@ def _record_noise_line(outcome: _RunOutcome, text: str) -> None:
 
 
 def _diagnostic_tails(outcome: _RunOutcome) -> tuple[str, str]:
-    """Bounded stdout-noise and agent-content tails, shared by detail + classification.
+    """Bounded stdout-noise and agent-content tails for the non-zero-exit path.
 
-    Kept as one source of truth so the non-zero-exit ``ProviderError`` in
-    ``_run_once`` can both report and classify against the same evidence.
+    ``_nonzero_exit_detail`` uses both halves; ``_run_once``'s classification
+    uses only the content half (it re-derives its own full-history stdout
+    noise string separately -- see the comment at its call site). Kept as
+    one source of truth so both bound the same accumulated ``outcome``.
     """
     stdout_tail = " | ".join(line.strip() for line in outcome.noise_lines[-5:] if line.strip())
     content_tail = " | ".join(p.strip() for p in outcome.content_parts[-3:] if p.strip())[-500:]
@@ -731,12 +733,23 @@ class ClaudeboxProvider(AgentProvider):
 
         Returns `None` (inherit the parent's environment unchanged) unless
         `auth_token`/`base_url` were explicitly configured -- today's M1
-        default. When set, both are layered on top of a copy of the
+        default -- or `CLAUDE_CODE_LONG_LIVED_TOKEN` is set in the parent
+        env. When any apply, they're layered on top of a copy of the
         current environment (never mutating `os.environ` itself).
+
+        `CLAUDE_CODE_LONG_LIVED_TOKEN` (a 1-year non-rotating `claude
+        setup-token` credential, held by the orchestration daemon and read
+        from the macOS keychain) is remapped to `CLAUDE_CODE_OAUTH_TOKEN` --
+        the name `claude` itself reads -- so agent boxes carry no
+        credentials file at all and never hit the OAuth refresh-rotation
+        race (kentra-io/harness#3).
         """
-        if self._auth_token is None and self._base_url is None:
+        long_lived = os.environ.get("CLAUDE_CODE_LONG_LIVED_TOKEN")
+        if self._auth_token is None and self._base_url is None and not long_lived:
             return None
         env = dict(os.environ)
+        if long_lived:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = long_lived
         if self._base_url:
             env["ANTHROPIC_BASE_URL"] = self._base_url
         if self._auth_token:
@@ -754,6 +767,11 @@ class ClaudeboxProvider(AgentProvider):
     ) -> list[str]:
         """Build the `cb exec ... claude ...` argument vector."""
         argv = [self._cb_binary, "exec"]
+        if os.environ.get("CLAUDE_CODE_LONG_LIVED_TOKEN"):
+            # Bare name: docker exec forwards the value from the client env,
+            # which _build_env populated -- the secret never enters argv
+            # (kentra-io/harness#3: env-auth boxes carry no session file).
+            argv += ["-e", "CLAUDE_CODE_OAUTH_TOKEN"]
         if worktree:
             argv += ["--workdir", str(worktree)]
         argv.append(str(box))

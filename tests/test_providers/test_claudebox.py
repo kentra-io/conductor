@@ -141,6 +141,29 @@ def main():
         }})
         sys.exit(1)
 
+    if mode == "stdout_connection_noise_oauth_content_exit":
+        # Cross-source classification: a retryable-looking keyword in stdout
+        # NOISE (not stream-json) alongside an OAuth-expiry message in the
+        # agent's stream-json CONTENT, then a non-zero exit. Both sources
+        # feed one `classify_text` string, so the OAuth check must still win
+        # even though the noise line alone would classify retryable.
+        print("API Error: Connection closed mid-response", flush=True)
+        emit({{
+            "type": "assistant",
+            "message": {{
+                "role": "assistant", "model": "claude-sonnet-4-5",
+                "content": [{{
+                    "type": "text",
+                    "text": (
+                        "Failed to authenticate: OAuth session expired "
+                        "and could not be refreshed"
+                    ),
+                }}],
+                "usage": {{"input_tokens": 10, "output_tokens": 5}},
+            }},
+        }})
+        sys.exit(1)
+
     if mode == "result_error":
         emit({{
             "type": "result", "subtype": "error", "is_error": True,
@@ -241,6 +264,7 @@ def fake_cb(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("FAKE_CB_EXIT_CODE", raising=False)
     monkeypatch.delenv("FAKE_CB_LS_EXIT_CODE", raising=False)
     monkeypatch.delenv("FAKE_CB_SLEEP_SECONDS", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_LONG_LIVED_TOKEN", raising=False)
     return script
 
 
@@ -518,6 +542,45 @@ class TestStructuredOutput:
             del os.environ["FAKE_CB_MODE"]
 
 
+class TestLongLivedTokenEnvInjection:
+    """kentra-io/harness#3: the orchestration daemon holds a 1-year
+    non-rotating `CLAUDE_CODE_LONG_LIVED_TOKEN` (macOS keychain); the
+    provider maps it to `CLAUDE_CODE_OAUTH_TOKEN` per invocation, forwarded
+    into the `cb exec` subprocess env plus a bare-name `-e` flag so `docker
+    exec` carries it into the box -- the secret itself never enters argv."""
+
+    async def test_build_env_maps_long_lived_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_LONG_LIVED_TOKEN", "sk-ant-oat01-x")
+        provider = ClaudeboxProvider()
+        env = provider._build_env()
+        assert env is not None
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-x"
+
+    async def test_build_env_still_none_without_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CLAUDE_CODE_LONG_LIVED_TOKEN", raising=False)
+        provider = ClaudeboxProvider()
+        assert provider._build_env() is None
+
+    async def test_build_argv_forwards_oauth_env_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CLAUDE_CODE_LONG_LIVED_TOKEN", "sk-ant-oat01-x")
+        provider = ClaudeboxProvider()
+        argv = provider._build_argv("box", None, "implementer", "opus", "hi")
+        i = argv.index("-e")
+        assert argv[i + 1] == "CLAUDE_CODE_OAUTH_TOKEN"  # bare name -- no secret in argv
+        assert "sk-ant-oat01-x" not in " ".join(argv)
+
+    async def test_build_argv_no_env_flag_without_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CLAUDE_CODE_LONG_LIVED_TOKEN", raising=False)
+        provider = ClaudeboxProvider()
+        assert "-e" not in provider._build_argv("box", None, "implementer", "opus", "hi")
+
+
 class TestErrorMapping:
     async def test_nonzero_exit_raises_provider_error(self, fake_cb: Path) -> None:
         os.environ["FAKE_CB_MODE"] = "error_exit"
@@ -636,6 +699,23 @@ class TestErrorMapping:
             await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
         assert excinfo.value.is_retryable is False
         assert "OAuth session expired" in str(excinfo.value)
+
+    async def test_cross_source_oauth_content_wins_over_stdout_noise_keyword(
+        self, fake_cb: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cross-source classification discrimination: a retryable-looking
+        keyword arrives via stdout NOISE while the OAuth-expiry text arrives
+        via stream-json CONTENT -- two different sources feeding the same
+        `classify_text` string. The OAuth check must still win even though
+        neither source alone would be ambiguous; pins that `content_tail` is
+        actually wired into classification (a reviewer noted this flips to
+        retryable if content is dropped from `classify_text`)."""
+        monkeypatch.setenv("FAKE_CB_MODE", "stdout_connection_noise_oauth_content_exit")
+        provider = ClaudeboxProvider(cb_binary=str(fake_cb))
+        agent = _make_agent()
+        with pytest.raises(ProviderError) as excinfo:
+            await provider.execute(agent, context={"box": "b"}, rendered_prompt="p")
+        assert excinfo.value.is_retryable is False
 
     async def test_cb_binary_missing_raises_provider_error(self, tmp_path: Path) -> None:
         provider = ClaudeboxProvider(cb_binary=str(tmp_path / "no-such-cb-binary"))
